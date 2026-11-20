@@ -31,17 +31,19 @@ static void service() {
   if (++qi >= qn) { out(0); return; }
   out(q[qi].hz); stepEnd = millis() + q[qi].ms;
 }
-// The sound palette: short, distinct, quiet.
-static void click()      { play({{2800, 9}}); }
-static void dbl()        { play({{2800, 8}, {0, 45}, {3400, 8}}); }
-static void right()      { play({{1900, 14}}); }
-static void middle()     { play({{2300, 12}}); }
-static void dragStart()  { play({{1500, 18}}); }
-static void key()        { play({{3300, 5}}); }
-static void open()       { play({{1800, 16}, {0, 20}, {2600, 22}}); }
-static void connected()  { play({{1568, 50}, {0, 20}, {2093, 70}}); }
-static void lost()       { play({{2093, 50}, {0, 20}, {1568, 70}}); }
-static void warn()       { play({{900, 120}}, true); }
+// The sound palette: low, short "tocks" instead of shrill beeps. A buzzer is
+// loudest/harshest near its ~2.7 kHz resonance, so everything sits far below it.
+static void click()      { play({{440, 10}}); }
+static void dbl()        { play({{440, 8}, {0, 40}, {523, 8}}); }
+static void right()      { play({{330, 14}}); }
+static void middle()     { play({{392, 12}}); }
+static void dragStart()  { play({{294, 16}}); }
+static void key()        { play({{494, 6}}); }
+static void open()       { play({{330, 14}, {0, 18}, {440, 18}}); }
+static void connected()  { play({{330, 40}, {0, 20}, {440, 60}}); }
+static void lost()       { play({{440, 40}, {0, 20}, {330, 60}}); }
+static void sleep()      { play({{392, 30}, {0, 20}, {262, 60}}, true); }
+static void warn()       { play({{220, 120}}, true); }
 }  // namespace buzz
 
 // ---------------- battery gauge ----------------

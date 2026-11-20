@@ -99,6 +99,7 @@ static void previews() {
     s.mode = MODE_NUMPAD; drawMain(g, s, st, kb); f.save("numpad" + sfx);
     s.mode = MODE_TRACKPAD;
     drawSettings(g, s, st, false); f.save("settings" + sfx);
+    drawSleep(g, st, true); f.save("sleep" + sfx);
   }
   Frame f(480, 800); Gfx g = f.gfx();
   Status off; off.pairing = true; off.battery = 9;

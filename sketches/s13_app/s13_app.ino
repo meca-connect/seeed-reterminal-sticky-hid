@@ -3,7 +3,8 @@
  *
  * Main screen (no text): dot-grid trackpad, thin scrollbar strip(s), status
  * dot top-centre (filled = connected, ring = not). LONG-PRESS THE DOT (~0.45 s)
- * to open Settings. Physical buttons are not used (they only wake from sleep).
+ * to open Settings. Buttons: OK/power short press = sleep (sleep screen);
+ * UP/DOWN = previous/next mode (Trackpad, Keyboard, Numpad).
  *
  * Gestures: 1F move; tap = click; tap-tap = double click; hold still or
  * tap-and-hold = drag; 2F drag = scroll (both axes); 2F tap = right click;
@@ -20,7 +21,8 @@
  * Power: CPU at 80 MHz; loop sleeps on the GT911 INT line between frames;
  * display controller in deep sleep between refreshes; BLE slave latency;
  * TX power 3 dBm; battery level (BQ27220) reported to the host; deep sleep
- * after 10 min without a host connection (wake: touch or UP/DOWN button).
+ * after 10 min without a host connection (wake: touch or any button); OK
+ * button sleep powers the touch controller off and wakes on a button only.
  *
  * Serial 115200: PING STATUS STATS FORGET MODE n ROT n SCREEN S|M LAT n
  *                REDRAW FULL BEEP SLEEP SLEEPMIN n
@@ -309,27 +311,70 @@ static void IRAM_ATTR touchIsr() {
 }
 
 // ------------------------------------------------------------------ power
-static void enterDeepSleep() {
-  Serial.println("[PWR] deep sleep (wake: touch or UP/DOWN)");
-  cancelGestures();
+// manual = put to sleep with the OK/power button: wakes on a button only (touch
+// powered off, so a bag or pocket can't wake it). Idle sleep also wakes on touch.
+static void enterDeepSleep(bool manual) {
+  Serial.printf("[PWR] deep sleep (%s; wake: %s)\n", manual ? "button" : "idle", manual ? "button" : "touch or button");
+  cancelGestures(); heldN = 0;
+  buzz::sleep();
   while (epdBusy()) { epdPoll(); delay(5); }
   screen = SCR_MAIN;
   Gfx g = makeGfx();
-  app::drawMain(g, S, ST, KB);
-  g.fill(g.w / 2 - 20, 0, 40, app::HANDLE_H, PAPER);
-  icon::moon(g, g.w / 2, app::HANDLE_H / 2 - 4, 10);
-  epdStart(false);
+  app::drawSleep(g, ST, manual);
+  epdStart(true);                                // full refresh: crisp, ghost-free sleep screen
   uint32_t t0 = millis();
-  while (epdBusy() && millis() - t0 < 5000) { epdPoll(); delay(5); }
+  while ((epdBusy() || buzz::qi < buzz::qn) && millis() - t0 < 5000) { epdPoll(); buzz::service(); delay(5); }
+  buzz::out(0);
   Serial.flush();
   detachInterrupt(21);
+  if (manual) { digitalWrite(42, LOW); }         // touch controller off
   for (gpio_num_t p : {GPIO_NUM_45, GPIO_NUM_46, GPIO_NUM_42, GPIO_NUM_39}) gpio_hold_en(p);   // 39: keep charging
   gpio_deep_sleep_hold_en();
-  int idle = digitalRead(21);
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, idle ? 0 : 1);
-  for (gpio_num_t p : {GPIO_NUM_5, GPIO_NUM_6}) { rtc_gpio_pullup_en(p); rtc_gpio_pulldown_dis(p); }
-  esp_sleep_enable_ext1_wakeup((1ULL << 5) | (1ULL << 6), ESP_EXT1_WAKEUP_ANY_LOW);
+  if (!manual) {
+    int idle = digitalRead(21);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, idle ? 0 : 1);
+  }
+  for (gpio_num_t p : {GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_6}) { rtc_gpio_pullup_en(p); rtc_gpio_pulldown_dis(p); }
+  esp_sleep_enable_ext1_wakeup((1ULL << 4) | (1ULL << 5) | (1ULL << 6), ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();
+}
+
+// ------------------------------------------------------------------ buttons
+// Active low: OK/power (GPIO4) short press = sleep; UP/DOWN cycle
+// Trackpad -> Keyboard -> Numpad. Actions fire on release; a button already
+// held at boot (the one that woke the device) is ignored until released.
+// Long-pressing OK is left alone: the board's power circuit uses it.
+struct Btn { uint8_t pin; bool down, armed; uint32_t t; };
+static Btn btns[3] = {{4, false, false, 0}, {5, false, false, 0}, {6, false, false, 0}};
+static void buttonsBegin() {
+  for (Btn& b : btns) {
+    rtc_gpio_deinit(gpio_num_t(b.pin));          // back from RTC (deep-sleep wake) to digital
+    pinMode(b.pin, INPUT_PULLUP);
+    b.down = digitalRead(b.pin) == LOW; b.armed = !b.down; b.t = millis();
+  }
+}
+static void setMode(uint8_t m) {
+  cancelGestures(); heldN = 0; owner = OWN_NONE;
+  if (screen == SCR_SETTINGS) { screen = SCR_MAIN; forgetConfirm.cancel(); }
+  S.mode = m % app::MODE_COUNT; KB = app::KbState();
+  savePrefs(); applySettings();
+  buzz::open(); requestRedraw();
+  Serial.printf("[BTN] mode=%u\n", S.mode);
+}
+static void buttonsService() {
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < 3; ++i) {
+    Btn& b = btns[i];
+    bool d = digitalRead(b.pin) == LOW;
+    if (d == b.down || now - b.t < 30) continue;  // 30 ms debounce
+    uint32_t held = now - b.t;
+    b.down = d; b.t = now;
+    if (d) continue;                              // act on release
+    if (!b.armed) { b.armed = true; continue; }
+    lastActivity = now;
+    if (i == 0) { if (held < 1500) enterDeepSleep(true); }
+    else setMode(i == 1 ? S.mode + app::MODE_COUNT - 1 : S.mode + 1);
+  }
 }
 
 // ------------------------------------------------------------------ serial
@@ -353,8 +398,8 @@ static void handleSerial() {
     else if (c.startsWith("LAT")) { hid::wantLatency = c.substring(3).toInt(); savePrefs(); Serial.printf("latency request=%u (next connect)\n", hid::wantLatency); }
     else if (c == "REDRAW") requestRedraw();
     else if (c == "FULL") requestRedraw(true);
-    else if (c == "BEEP") { buzz::play({{2000, 40}, {0, 30}, {2600, 40}}, true); }
-    else if (c == "SLEEP") enterDeepSleep();
+    else if (c == "BEEP") { buzz::play({{330, 40}, {0, 30}, {440, 40}}, true); }
+    else if (c == "SLEEP") enterDeepSleep(true);
     else if (c.startsWith("SLEEPMIN")) { sleepAfterMs = uint32_t(c.substring(8).toInt()) * 60000UL; Serial.printf("sleep after %lu ms\n", sleepAfterMs); }
     else if (c.length()) Serial.printf("? %s\n", c.c_str());
   }
@@ -369,6 +414,8 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.printf("S13 APP — wake cause %d, cpu %lu MHz\n", int(esp_sleep_get_wakeup_cause()), getCpuFrequencyMhz());
   loadPrefs();
+  rtc_gpio_deinit(GPIO_NUM_21);                  // touch INT back to digital after an ext0 wake
+  buttonsBegin();
   buzz::begin();
   batt::begin();
   ST.battery = batt::ok ? batt::pct : -1; ST.charging = batt::charging();
@@ -416,8 +463,9 @@ void loop() {
   serviceRedraw();
   handleService();
   keysRepeat();
+  buttonsService();
 
-  if (!conn && sleepAfterMs && millis() - lastActivity > sleepAfterMs && !redrawPending) enterDeepSleep();
+  if (!conn && sleepAfterMs && millis() - lastActivity > sleepAfterMs && !redrawPending) enterDeepSleep(false);
 
   // Sleep until the touch controller signals (or a short timeout for timers).
   bool busyTimers = owner != OWN_NONE || buzz::qi < buzz::qn || heldN;

@@ -296,6 +296,28 @@ inline void drawMain(const Gfx& g, const Settings& s, const Status& st, const Kb
   drawStatusDot(g, st);
 }
 
+// Sleep screen: stays on the e-paper (no power) while the device sleeps.
+inline void drawSleep(const Gfx& g, const Status& st, bool buttonOnly) {
+  g.clear();
+  int cx = g.w / 2, cy = g.h / 2 - 70, r = 54;
+  icon::moon(g, cx, cy, r);
+  g.ring(cx, cy, r + 30, 2);                       // halo (after the moon's paper cut-out)
+  const char* title = "Sleeping";
+  g.text(geist_title, cx - Gfx::textWidth(geist_title, title) / 2, cy + r + 90, title);
+  const char* hint = buttonOnly ? "Press any button to wake" : "Touch or press a button to wake";
+  g.text(geist_sm, cx - Gfx::textWidth(geist_sm, hint) / 2, cy + r + 132, hint);
+  if (st.battery >= 0) {                           // battery pill, bottom centre
+    char buf[8]; int n = st.battery, i = 0;
+    if (n >= 100) buf[i++] = '1', buf[i++] = '0', buf[i++] = '0';
+    else { if (n >= 10) buf[i++] = char('0' + n / 10); buf[i++] = char('0' + n % 10); }
+    buf[i++] = '%'; buf[i] = 0;
+    int tw = Gfx::textWidth(geist_sm, buf), bw = 38, gap = 10, total = bw + gap + tw;
+    int x = cx - total / 2, y = g.h - 60;
+    icon::battery(g, x, y - 10, bw, 20, st.battery, st.charging);
+    g.text(geist_sm, x + bw + gap, y + 7, buf);
+  }
+}
+
 // Largest of medium/body/small that fits the width.
 inline const StickyFont& fitFont(const char* const* labels, int n, int maxW) {
   const StickyFont* fonts[3] = {&geist_med, &geist_body, &geist_sm};

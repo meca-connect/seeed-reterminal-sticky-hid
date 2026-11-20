@@ -11,6 +11,7 @@ Firmware: `sketches/s13_app/` · Status: **daily-usable prototype** (2026-11-19)
 <img src="images/keyboard.png" width="180" alt="Keyboard screen">
 <img src="images/numpad.png" width="180" alt="Numpad screen">
 <img src="images/settings.png" width="180" alt="Settings screen">
+<img src="images/sleep.png" width="180" alt="Sleep screen">
 </p>
 
 *Screens rendered on the host from the same drawing code the device runs
@@ -26,7 +27,9 @@ Firmware: `sketches/s13_app/` · Status: **daily-usable prototype** (2026-11-19)
 | **Keyboard** | QWERTY + symbol layer, esc/tab/arrow row, with a small trackpad above the keys (portrait). |
 | **Numpad** | 4×5 keypad with tab, `/ * - +`, backspace and a tall enter, with a small trackpad above the keys. |
 | **Settings** | Hold the status dot for about 0.5 s. Mode, scrollbar side, pointer speed, rotation, click sound, forget host. |
-| **Feedback** | Buzzer cues for each click type, swipes, keys, connect and disconnect (can be turned off). |
+| **Buttons** | OK/power short press = sleep (shows a sleep screen). UP / DOWN = previous / next mode (Trackpad → Keyboard → Numpad). |
+| **Sleep** | Full-refresh "Sleeping" screen with battery level stays on the e-paper. Button sleep turns touch off and wakes on any button; idle sleep (10 min, no host) also wakes on touch. |
+| **Feedback** | Low, short buzzer ticks (220–520 Hz, far below the buzzer's shrill ~2.7 kHz resonance) for each click type, swipes, keys, connect, disconnect and sleep (can be turned off). |
 | **Battery** | Real percentage from the fuel gauge, shown in Settings and reported to the computer over Bluetooth. |
 | **Power** | 80 MHz CPU, touch-interrupt wakeups, display asleep between refreshes, BLE slave latency, deep sleep after 10 min with no host. |
 
@@ -105,7 +108,7 @@ reflashes. **Done** saves and returns to the main screen with a clean full refre
 | Buzzer | GPIO48 (LEDC) | ~37% duty |
 | Fuel gauge BQ27220 | I2C1 SDA1 SCL0, `0x55` | SOC `0x2C`, voltage `0x08` |
 | Charger BQ25616 | EN_BAT_CHGn GPIO39 (**drive LOW**), STAT GPIO40 | Without GPIO39 low the battery never charges |
-| Buttons | POWER/OK 4, UP 5, DOWN 6 (active low) | Unused in the UI; UP/DOWN wake from deep sleep |
+| Buttons | POWER/OK 4, UP 5, DOWN 6 (active low) | OK short press = sleep, UP/DOWN = mode; any button wakes. OK long press left to the power circuit |
 | USB-C | CH343P USB-UART only | No native USB HID on the stock port, so Bluetooth is the transport |
 
 Geometry evidence: `docs/GEOMETRY.md`. Schematic: `docs/hardware/`.
@@ -175,7 +178,7 @@ python3 scripts/gen_font.py sketches/s13_app/fonts.h \
 | `REDRAW`, `FULL` | Partial / full redraw |
 | `FORGET` | Delete bonds and advertise |
 | `LAT n` | Requested slave latency (next connection) |
-| `BEEP`, `SLEEP`, `SLEEPMIN n` | Test sound, deep sleep now, set sleep timeout (0 = never) |
+| `BEEP`, `SLEEP`, `SLEEPMIN n` | Test sound, button-style sleep now, set idle sleep timeout (0 = never) |
 
 ---
 
@@ -206,7 +209,7 @@ python3 scripts/gen_font.py sketches/s13_app/fonts.h \
 **Keyboard**
 - Modifier keys (Ctrl, Alt, Super) and a shortcuts row: copy, paste, undo, screenshot.
 - Media keys (volume, play/pause, brightness) through a Consumer Control report.
-- Macro / stream-deck page: big custom buttons that send key combos or text snippets.
+- **Next big step:** stream-deck mode: a grid of big custom buttons (icons, no text clutter) that send shortcuts, key combos, text snippets or media keys, with several pages switched by UP/DOWN.
 - Non-US layouts.
 
 **Display & UI**
