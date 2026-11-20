@@ -1,0 +1,550 @@
+/*
+ * ============================================================================
+ * EPD75 Precision Touchpad  -  GDEY075T7-T01 + Good Display ESP32-M1, over BLE
+ * ============================================================================
+ * Windows Precision Touchpad via HID-over-GATT. Windows performs all gesture
+ * interpretation (3/4-finger swipes, task view, desktop switch, pinch, native
+ * ballistics and inertia) - none of it is coded here. Non-Windows hosts fall
+ * back to a plain relative mouse automatically.
+ *
+ * Reference project: https://github.com/meca-connect/m5papers3-trackpad
+ *
+ * --------------------------------------------------------------------------
+ * MEASURED ON THIS HARDWARE (see README.md for full tables)
+ * --------------------------------------------------------------------------
+ *   GT911 ....... 5 contacts, native track IDs 0-4, 800x480 native (identity)
+ *   I2C ......... hardware Wire @400 kHz = 243 us/poll (bit-banged was 1855 us)
+ *   EPD ......... ~365 ms fixed per refresh, ANY window size. Deep black needs
+ *                 EPD_init() (NOT EPD_init_Fast) + a DeepClean conditioning pass.
+ *
+ * THE DISPLAY IS NEVER TOUCHED ON THE INPUT PATH. It is drawn once at boot and
+ * then put to sleep. The host draws the cursor. At 365 ms minimum per refresh
+ * there is no version of "live feedback on e-paper" that is not terrible.
+ *
+ * *** NO NEAREST-NEIGHBOUR CONTACT TRACKER. *** The GT911 supplies stable
+ * per-finger IDs directly; PTP requires exactly that. The T5 build needed a
+ * tracker only because SensorLib hid the IDs.
+ */
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
+#include "ptp_descriptor.h"
+#include "epd_m1.h"
+#include "gt911_wire.h"
+#include "epd_canvas.h"
+#include <Fonts/FreeSerif9pt7b.h>
+#include <Fonts/FreeSerif12pt7b.h>
+#include <Fonts/FreeSerifItalic12pt7b.h>
+#include <Fonts/FreeSerifBold24pt7b.h>
+
+static EpdCanvas gfx;
+
+// Rotate the whole device 180 degrees. Flips the rendered image AND the touch
+// coordinates together, so the pointer keeps tracking the finger. Set to 0 for
+// the original orientation.
+#define FLIP_180 1
+
+// ---------------------------------------------------------------------------
+// CLICK SOURCE
+//   1 = firmware defines the click and reports the real HID button bit.
+//       Pad Type is declared 0 (DEPRESSIBLE) so Windows does NOT also synthesise
+//       clicks from taps - otherwise every tap would fire twice. A double tap
+//       then produces two genuine button events, so double-click selects a word
+//       the way a normal trackpad does.
+//   0 = previous behaviour: Pad Type 1 (non-depressible), Windows infers
+//       tap-to-click itself. Revert here if the firmware detector feels worse.
+// ---------------------------------------------------------------------------
+#define FIRMWARE_CLICK 1
+
+#define TAP_MAX_MS        220   // from papers3_trackpad_v0_8_1 (TAP_MAX_MS)
+#define TAP_MAX_MOVE       14   // from papers3_trackpad_v0_8_1 (TAP_MAX_DIST_PX)
+#define DRAG_WINDOW_MS    340   // from papers3_trackpad_v0_8_1 (DOUBLE_TAP_GAP_MS)
+#define DRAG_RADIUS        45   // from papers3_trackpad_v0_8_1 (DOUBLE_TAP_RADIUS_PX)
+#define CLICK_HOLD_MS      40   // how long the synthetic press is held down
+
+// ---------------------------------------------------------------------------
+// BLE HID
+// ---------------------------------------------------------------------------
+static NimBLEServer*         server   = nullptr;
+static NimBLEHIDDevice*      hid      = nullptr;
+static NimBLECharacteristic* chrTouch = nullptr;
+static NimBLECharacteristic* chrMouse = nullptr;
+static NimBLECharacteristic* chrCaps  = nullptr;
+static NimBLECharacteristic* chrHqa   = nullptr;
+static NimBLECharacteristic* chrMode  = nullptr;
+static NimBLECharacteristic* chrSel   = nullptr;
+static NimBLECharacteristic* chrLat   = nullptr;
+
+static volatile bool     hostConnected  = false;
+static volatile uint32_t connIntervalUs = 7500;   // updated from the live link
+static volatile uint8_t inputMode     = 0;      // 0 = mouse fallback, 3 = PTP
+static uint8_t          hqaSegment    = 1;
+
+class ServerCB : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
+    hostConnected = true;
+    Serial.println("[ble] connected");
+    // 6 = 7.5 ms, the BLE floor (~133 Hz). PTP wants 125 Hz single / 100 Hz
+    // multi-contact, so this is the whole latency budget. Watch what the host
+    // actually grants - it often insists on 15 ms.
+    // min = max = 6 units (7.5 ms). Giving the host a RANGE lets it pick the
+    // slow end (15 ms = 66 Hz); pinning both ends asks for the BLE floor.
+    s->updateConnParams(info.getConnHandle(), 6, 6, 0, 300);
+  }
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+    hostConnected = false; inputMode = 0;
+    Serial.printf("[ble] disconnected (reason %d)\n", reason);
+    NimBLEDevice::startAdvertising();
+  }
+  void onMTUChange(uint16_t mtu, NimBLEConnInfo&) override {
+    Serial.printf("[ble] MTU = %u\n", mtu);
+  }
+  // The host decides the real interval. Pace our sending to whatever it grants,
+  // otherwise we queue reports faster than the radio drains them (buffer bloat)
+  // and the pointer lags further behind the finger the longer you move.
+  void onConnParamsUpdate(NimBLEConnInfo& info) override {
+    uint16_t itvl = info.getConnInterval();            // units of 1.25 ms
+    connIntervalUs = (uint32_t)itvl * 1250UL;
+    Serial.printf("[ble] conn interval = %u units = %.2f ms  (%.0f Hz)  latency=%u\n",
+                  itvl, itvl * 1.25f, 1000.0f / (itvl * 1.25f), info.getConnLatency());
+  }
+};
+
+static void serveHqaSegment(NimBLECharacteristic* c) {
+  uint8_t seg[33];
+  seg[0] = hqaSegment;
+  memcpy(&seg[1], &ptphqaBlob[(hqaSegment - 1) * 32], 32);
+  c->setValue(seg, sizeof(seg));
+}
+
+// Which input report did the host actually subscribe to? notify() on an
+// unsubscribed characteristic silently does nothing - this makes that visible.
+class InputCB : public NimBLECharacteristicCallbacks {
+ public:
+  const char* name;
+  volatile bool subscribed = false;
+  InputCB(const char* n) : name(n) {}
+  void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t subValue) override {
+    subscribed = (subValue & 0x0001) != 0;
+    Serial.printf("[ble] host %s '%s' (subValue=0x%04X)\n",
+                  subscribed ? "SUBSCRIBED to" : "unsubscribed from", name, subValue);
+  }
+};
+static InputCB touchCB("touchpad report 0x01");
+static InputCB mouseCB("mouse report 0x07");
+
+class FeatureCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+    std::string v = c->getValue();
+    if (v.empty()) return;
+    if (c == chrMode) {
+      inputMode = (uint8_t)v[0];
+      Serial.printf("[ptp] Input Mode = %u  (%s)\n", inputMode,
+                    inputMode == 3 ? "PRECISION TOUCHPAD" : "mouse fallback");
+    } else if (c == chrHqa) {
+      uint8_t s = (uint8_t)v[0];
+      hqaSegment = (s < 1) ? 1 : (s > 8 ? 8 : s);
+      serveHqaSegment(c);
+      Serial.printf("[ptp] PTPHQA segment %u/8 served\n", hqaSegment);
+    }
+  }
+  void onRead(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+    if (c == chrHqa)       { serveHqaSegment(c); Serial.printf("[ptp] READ PTPHQA seg %u\n", hqaSegment); }
+    else if (c == chrCaps) { Serial.println("[ptp] READ device capabilities"); }
+    else if (c == chrMode) { Serial.println("[ptp] READ input mode"); }
+    else if (c == chrSel)  { Serial.println("[ptp] READ selective reporting"); }
+    else if (c == chrLat)  { Serial.println("[ptp] READ latency mode"); }
+  }
+};
+static FeatureCB featureCB;
+
+static void ble_begin() {
+  NimBLEDevice::init("EPD75 Trackpad");
+  NimBLEDevice::setSecurityAuth(true, false, true);   // bond, no MITM, LE SC
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  server = NimBLEDevice::createServer();
+  server->setCallbacks(new ServerCB());
+
+  hid = new NimBLEHIDDevice(server);
+  hid->setManufacturer("meca-connect");
+  hid->setPnp(0x02, 0x1209, 0x7501, 0x0100);
+  hid->setHidInfo(0x00, 0x01);
+  hid->setReportMap((uint8_t*)ptpReportDescriptor, sizeof(ptpReportDescriptor));
+
+  chrTouch = hid->getInputReport(RID_TOUCHPAD);
+  chrMouse = hid->getInputReport(RID_MOUSE);
+  chrCaps  = hid->getFeatureReport(RID_CAPS);
+  chrHqa   = hid->getFeatureReport(RID_PTPHQA);
+  chrMode  = hid->getFeatureReport(RID_INPUT_MODE);
+  chrSel   = hid->getFeatureReport(RID_SELECTIVE);
+  chrLat   = hid->getFeatureReport(RID_LATENCY);
+
+  // Device capabilities: low nibble = Contact Count Maximum, high nibble = Pad
+  // Type. Pad Type 0 = DEPRESSIBLE (a click-pad with a real hardware button);
+  // 1 = NON-DEPRESSIBLE. This panel is a sheet of glass with no button, so it
+  // must be 1. Declaring 0 makes Windows wait for a physical button press that
+  // can never arrive -> no click and no drag, even though tracking works fine.
+#if FIRMWARE_CLICK
+  // 0 = depressible: we report the button ourselves, Windows must not add taps.
+  const uint8_t padType = 0;
+#else
+  // 1 = non-depressible: no button exists, Windows derives clicks from taps.
+  const uint8_t padType = 1;
+#endif
+  uint8_t caps[1] = { (uint8_t)(PTP_CONTACTS | (padType << 4)) };
+  chrCaps->setValue(caps, sizeof(caps));
+  uint8_t zero = 0;
+  chrMode->setValue(&zero, 1);
+  chrSel->setValue(&zero, 1);
+  chrLat->setValue(&zero, 1);
+  serveHqaSegment(chrHqa);
+
+  chrMode->setCallbacks(&featureCB);
+  chrHqa->setCallbacks(&featureCB);
+  chrCaps->setCallbacks(&featureCB);
+  chrSel->setCallbacks(&featureCB);
+  chrLat->setCallbacks(&featureCB);
+  chrTouch->setCallbacks(&touchCB);
+  chrMouse->setCallbacks(&mouseCB);
+
+  server->start();
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setAppearance(0x03C2);
+  adv->addServiceUUID(hid->getHidService()->getUUID());
+  adv->enableScanResponse(true);
+  NimBLEDevice::startAdvertising();
+  Serial.println("[ble] advertising as 'EPD75 Trackpad'");
+}
+
+// ---------------------------------------------------------------------------
+// Static e-paper UI - drawn ONCE, deep black, then asleep forever.
+// ---------------------------------------------------------------------------
+// Draw a string in the current font with its LEFT baseline at (x, y).
+static void text_at(int x, int y, const char *str) {
+  gfx.setCursor(x, y);
+  gfx.print(str);
+}
+// ...and centred on x.
+static int text_w(const char *str) {
+  int16_t bx, by; uint16_t w, h;
+  gfx.getTextBounds(str, 0, 0, &bx, &by, &w, &h);
+  return (int)w;
+}
+
+// ---------------------------------------------------------------------------
+// Static UI. Editorial rather than "embedded": a serif wordmark, a hairline
+// rule, generous asymmetric margins, and a quiet dot field for the touch
+// surface. Drawn once in deep black, then the panel sleeps for good.
+// ---------------------------------------------------------------------------
+static void draw_static_ui() {
+  fb_clear(1);
+  gfx.setTextWrap(false);
+  gfx.setTextColor(1);                    // black ink
+
+  const int L = 64;                       // left margin - everything aligns here
+  const int R = EPD_WIDTH - 64;
+
+  // wordmark
+  gfx.setFont(&FreeSerifBold24pt7b);
+  text_at(L, 112, "Trackpad");
+
+  // hairline rule under the wordmark
+  fb_fill(L, 140, R - L, 1, 1);
+
+  // subtitle, italic serif
+  gfx.setFont(&FreeSerifItalic12pt7b);
+  text_at(L, 176, "Precision touch over Bluetooth");
+
+  // quiet dot field = the working surface
+  for (int y = 224; y <= EPD_HEIGHT - 116; y += 28)
+    for (int x = L; x <= R; x += 28)
+      fb_pixel(x, y, 1);
+
+  // footer rule + specs, small serif
+  fb_fill(L, EPD_HEIGHT - 86, R - L, 1, 1);
+  gfx.setFont(&FreeSerif9pt7b);
+  text_at(L, EPD_HEIGHT - 58, "Four contacts   .   800 x 480   .   GT911");
+
+  const char *rhs = "Gestures handled by Windows";
+  gfx.setFont(&FreeSerif9pt7b);
+  text_at(R - text_w(rhs), EPD_HEIGHT - 58, rhs);
+
+  // restrained frame: thin, inset
+  gfx.drawRect(24, 24, EPD_WIDTH - 48, EPD_HEIGHT - 48, 1);
+
+#if FLIP_180
+  fb_rotate180();
+#endif
+
+  EPD_init();            // full-quality init - deep black (NOT EPD_init_Fast)
+  EPD_DeepClean(1);      // condition particles so the one frame is full contrast
+  EPD_FullUpdate(epd_fb);
+  EPD_sleep();
+}
+
+// ---------------------------------------------------------------------------
+// Contact bookkeeping - needed ONLY for lift-off reporting.
+// A finger that disappears must be reported once with Tip=0 at its last
+// coordinates or Windows leaves it stuck down forever.
+// ---------------------------------------------------------------------------
+static uint8_t  prevId[GT911_MAX_CONTACTS];
+static uint16_t prevX[GT911_MAX_CONTACTS], prevY[GT911_MAX_CONTACTS];
+static int      prevN = 0;
+
+// fallback-mouse state
+static bool     mouseTracking = false;
+static uint16_t lastMx = 0, lastMy = 0;
+static uint32_t touchDownMs = 0;
+static uint16_t downX = 0, downY = 0;
+static bool     movedFar = false;
+
+static inline uint16_t scanTime100us() { return (uint16_t)((micros() / 100) & 0xFFFF); }
+
+// ---------------------------------------------------------------------------
+// Firmware click detector.
+//
+// A tap is: one contact down and up inside TAP_MAX_MS having travelled less
+// than TAP_MAX_MOVE. On release we assert the HID button for CLICK_HOLD_MS,
+// which at a 7.5 ms interval is a few reports - long enough for the host to
+// register a clean press-and-release.
+//
+// Tap-then-hold is a drag: if a new contact lands within DRAG_WINDOW_MS of a
+// tap and stays down, the button is held for as long as that contact lives, so
+// the user drags without Windows having to infer anything.
+// ---------------------------------------------------------------------------
+static bool     btnState      = false;   // reported in PtpReport.buttons
+static bool     contactDown   = false;
+static uint32_t downMs        = 0;
+static uint16_t downPx = 0, downPy = 0;
+static bool     travelled     = false;
+static uint32_t lastTapMs     = 0;
+static uint16_t lastTapX = 0, lastTapY = 0;
+static bool     dragging      = false;
+static uint32_t clickCount    = 0;
+
+// A tap is only recognised once the finger has LIFTED - but a Precision
+// Touchpad button press with contactCount = 0 is not a thing a real clickpad
+// can produce (you cannot press the button without a finger on it), and the
+// host discards it. So on tap we REPLAY the contact: hold it reported as still
+// down, with the button asserted, for CLICK_HOLD_MS. The host then sees an
+// ordinary physical click - finger down, button down, button up, finger up -
+// and two of them in quick succession are a real double-click.
+static bool      clickReplay  = false;
+static uint32_t  replayUntil  = 0;
+static GTContact replayC;
+static GTContact lastSeen;
+
+static inline uint32_t dist2(int ax, int ay, int bx, int by) {
+  int dx = ax - bx, dy = ay - by;
+  return (uint32_t)(dx * dx + dy * dy);
+}
+
+static void click_update(const GTContact *c, int n) {
+  uint32_t now = millis();
+
+  if (n > 0) {
+    lastSeen = c[0];
+    if (!contactDown) {                        // ---- touch down
+      contactDown = true;
+      downMs = now; downPx = c[0].x; downPy = c[0].y;
+      travelled = false;
+      // tap, then touch down again nearby and soon => drag
+      if ((now - lastTapMs) <= DRAG_WINDOW_MS &&
+          dist2(c[0].x, c[0].y, lastTapX, lastTapY) <= (uint32_t)DRAG_RADIUS * DRAG_RADIUS) {
+        dragging = true;
+        btnState = true;
+        clickReplay = false;
+        Serial.println("[click] drag start");
+      }
+    } else if (dist2(c[0].x, c[0].y, downPx, downPy) >
+               (uint32_t)TAP_MAX_MOVE * TAP_MAX_MOVE) {
+      travelled = true;
+    }
+  } else if (contactDown) {                    // ---- lift
+    contactDown = false;
+    if (dragging) {
+      dragging = false;
+      btnState = false;
+      Serial.println("[click] drag end");
+    } else if ((now - downMs) <= TAP_MAX_MS && !travelled) {
+      clickReplay = true;                      // replay the contact + button
+      replayC     = lastSeen;
+      replayUntil = now + CLICK_HOLD_MS;
+      btnState    = true;
+      lastTapMs   = now; lastTapX = downPx; lastTapY = downPy;
+      clickCount++;
+      Serial.printf("[click] tap -> click %lu\n", (unsigned long)clickCount);
+    }
+  }
+
+  if (clickReplay && now >= replayUntil) {     // end of the synthetic press
+    clickReplay = false;
+    btnState    = false;
+  }
+}
+
+static void send_ptp(const GTContact *c, int n) {
+  PtpReport r;
+  memset(&r, 0, sizeof(r));
+  int idx = 0;
+
+  for (int k = 0; k < n && idx < PTP_CONTACTS; k++) {
+    r.c[idx].flags = 0x03;                  // confidence | tip switch (down)
+    r.c[idx].id    = c[k].id;               // native GT911 track ID
+    r.c[idx].x     = (uint16_t)(c[k].x * 2);   // 0..799  -> 0..1598 logical
+    r.c[idx].y     = (uint16_t)(c[k].y * 2);   // 0..479  -> 0..958  logical
+    idx++;
+  }
+  // any ID present last frame but gone now => report it ONCE with tip = 0
+  for (int j = 0; j < prevN && idx < PTP_CONTACTS; j++) {
+    bool still = false;
+    for (int k = 0; k < n; k++) if (c[k].id == prevId[j]) { still = true; break; }
+    if (still) continue;
+    r.c[idx].flags = 0x01;                  // confidence, tip = 0 (lifted)
+    r.c[idx].id    = prevId[j];
+    r.c[idx].x     = (uint16_t)(prevX[j] * 2);
+    r.c[idx].y     = (uint16_t)(prevY[j] * 2);
+    idx++;
+  }
+
+  r.contactCount = (uint8_t)idx;
+  r.scanTime     = scanTime100us();
+  r.buttons      = btnState ? 0x01 : 0x00;
+  chrTouch->setValue((uint8_t*)&r, sizeof(r));
+  chrTouch->notify();
+}
+
+static void send_mouse(const GTContact *c, int n) {
+  MouseReport m = {0, 0, 0};
+
+  if (n >= 1) {
+    if (!mouseTracking) {                    // finger just landed
+      mouseTracking = true;
+      lastMx = c[0].x; lastMy = c[0].y;
+      downX = c[0].x;  downY = c[0].y;
+      touchDownMs = millis();
+      movedFar = false;
+    } else {
+      int dx = (int)c[0].x - (int)lastMx;
+      int dy = (int)c[0].y - (int)lastMy;
+      lastMx = c[0].x; lastMy = c[0].y;
+      if (abs((int)c[0].x - (int)downX) > 12 || abs((int)c[0].y - (int)downY) > 12)
+        movedFar = true;
+      // light acceleration, clamped to the int8 report field
+      int ax = dx + (dx * abs(dx)) / 12;
+      int ay = dy + (dy * abs(dy)) / 12;
+      m.x = (int8_t)constrain(ax, -127, 127);
+      m.y = (int8_t)constrain(ay, -127, 127);
+    }
+  } else if (mouseTracking) {                // all fingers lifted
+    mouseTracking = false;
+    bool quick = (millis() - touchDownMs) < 220;
+    if (quick && !movedFar) {                // tap -> click (down then up)
+      m.buttons = 0x01;
+      chrMouse->setValue((uint8_t*)&m, sizeof(m));
+      chrMouse->notify();
+      delay(12);
+      m.buttons = 0x00;
+    }
+  }
+  chrMouse->setValue((uint8_t*)&m, sizeof(m));
+  chrMouse->notify();
+}
+
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+  Serial.println("\n\n=== EPD75 Precision Touchpad (BLE) ===");
+
+  EPD_GPIOInit();
+  Serial.print("GT911 (hardware I2C @400kHz): ");
+  Serial.println(gt911_begin(400000) ? "ok" : "NOT RESPONDING");
+  Serial.printf("config allows %d contacts\n", gt911_max_contacts());
+
+  Serial.println("drawing static UI (deep black, ~12 s once)...");
+  draw_static_ui();
+
+  ble_begin();
+  Serial.println("ready\n");
+}
+
+// ---------------------------------------------------------------------------
+// Report pacing.
+//
+// The GT911 can be polled every ~243 us (about 4 kHz). BLE can carry one report
+// per connection interval (7.5 ms at best, ~133 Hz). Notifying on every poll
+// therefore queues ~30 reports for every one the radio can send: the queue grows,
+// every report is delivered late, and the lag compounds the longer you move.
+// That also wrecks click and drag, because Windows infers tap and drag timing
+// from WHEN reports arrive.
+//
+// So: sample as fast as we can, keep only the newest sample, and emit exactly
+// one report per connection interval. While any contact is down we re-send the
+// current state every interval even if the GT911 has nothing new - a real
+// touchpad reports continuously, and Windows needs that steady stream to sustain
+// a drag rather than treating the gap as a lift.
+// ---------------------------------------------------------------------------
+static GTContact curC[GT911_MAX_CONTACTS];
+static int       curN = 0;
+static uint32_t  lastSendUs = 0;
+
+void loop() {
+  GTContact c[GT911_MAX_CONTACTS];
+  int n = gt911_read(c);
+
+  if (n >= 0) {
+#if FLIP_180
+    for (int k = 0; k < n; k++) {
+      c[k].x = (uint16_t)(EPD_WIDTH  - 1 - c[k].x);
+      c[k].y = (uint16_t)(EPD_HEIGHT - 1 - c[k].y);
+    }
+#endif
+    curN = n;                                   // newest sample wins
+    for (int k = 0; k < n; k++) curC[k] = c[k];
+  }
+
+  if (!hostConnected) { curN = 0; prevN = 0; return; }
+
+  uint32_t now = micros();
+  if ((uint32_t)(now - lastSendUs) < connIntervalUs) return;   // pace to the radio
+
+#if FIRMWARE_CLICK
+  // Run the detector on every paced tick, BEFORE the quiet check. A tap asserts
+  // the button after the finger has already lifted, so if we went quiet as soon
+  // as contacts hit zero we would send button-down and never send button-up -
+  // leaving the button stuck down on the host.
+  click_update(curC, curN);
+  bool clickPending = btnState || clickReplay;
+#else
+  bool clickPending = false;
+#endif
+
+  // Nothing down, nothing to retire, no click in flight -> stay quiet.
+  if (curN == 0 && prevN == 0 && !clickPending) return;
+
+  lastSendUs = now;
+
+  // While replaying a tap, report the contact as still down so the button press
+  // arrives with a contact attached - what a physical click looks like.
+  const GTContact *sendC = curC;
+  int              sendN = curN;
+#if FIRMWARE_CLICK
+  if (clickReplay) { sendC = &replayC; sendN = 1; }
+#endif
+
+  static uint32_t nPtp = 0, nMouse = 0, lastRpt = 0;
+  if (inputMode == 3) { send_ptp(sendC, sendN);   nPtp++; }
+  else                { send_mouse(sendC, sendN); nMouse++; }
+
+  prevN = sendN;
+  for (int k = 0; k < sendN; k++) { prevId[k] = sendC[k].id; prevX[k] = sendC[k].x; prevY[k] = sendC[k].y; }
+
+  if (millis() - lastRpt > 2000) {
+    lastRpt = millis();
+    Serial.printf("[rpt] mode=%u ptp=%lu mouse=%lu  interval=%.2fms  n=%d (%u,%u)\n",
+                  inputMode, (unsigned long)nPtp, (unsigned long)nMouse,
+                  connIntervalUs / 1000.0f, curN,
+                  curN ? curC[0].x : 0, curN ? curC[0].y : 0);
+  }
+}

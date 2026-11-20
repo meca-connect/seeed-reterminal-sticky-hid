@@ -1,0 +1,14 @@
+build/
+backups/
+reference/
+logs/
+sketches/**/build/
+__pycache__/
+*.pyc
+*.bin
+*.elf
+*.map
+*.o
+.DS_Store
+SESSION_HANDOFF.md
+sketches/s9_sticky_ptp_ble/artifacts/
